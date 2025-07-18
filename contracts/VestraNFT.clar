@@ -149,3 +149,202 @@
     )
   )
 )
+
+
+;; Enhanced utility setter
+(define-public (set-level-utility (token-id uint) (level uint) (utility (string-ascii 256)))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) (err err-owner-only))
+    ;; Check if token exists
+    (asserts! (is-some (map-get? tokens { token-id: token-id })) (err err-invalid-token))
+    ;; Validate utility string is not empty
+    (asserts! (> (len utility) u0) (err err-invalid-params))
+    (ok (map-set token-levels { token-id: token-id, level: level } { utility: utility }))
+  )
+)
+
+;; Enhanced price setters
+(define-public (set-mint-price (new-price uint))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) (err err-owner-only))
+    (asserts! (> new-price u0) (err err-invalid-params))
+    (ok (var-set mint-price new-price))
+  )
+)
+
+(define-public (set-level-up-price (new-price uint))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) (err err-owner-only))
+    (asserts! (> new-price u0) (err err-invalid-params))
+    (ok (var-set level-up-price new-price))
+  )
+)
+
+;; Enhanced STX withdrawal
+(define-public (withdraw-stx (amount uint))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) (err err-owner-only))
+    (asserts! (> amount u0) (err err-zero-amount))
+
+    (let ((contract-balance (stx-get-balance (as-contract tx-sender))))
+      (asserts! (>= contract-balance amount) (err err-insufficient-funds))
+
+      (match (as-contract (stx-transfer? amount tx-sender contract-owner))
+        success (ok amount)
+        error (err err-insufficient-funds))
+    )
+  )
+)
+
+;; Enhanced read-only functions
+(define-read-only (get-last-token-id)
+  (ok (var-get token-id-nonce))
+)
+
+(define-read-only (get-token-uri (token-id uint))
+  (if (is-some (map-get? tokens { token-id: token-id }))
+    (ok none)
+    (err err-invalid-token)
+  )
+)
+
+(define-read-only (get-owner (token-id uint))
+  (match (map-get? tokens { token-id: token-id })
+    token-data (ok (some (get owner token-data)))
+    (err err-invalid-token)
+  )
+)
+
+;; Transfer token
+(define-public (transfer (token-id uint) (sender principal) (recipient principal))
+  (begin
+    ;; Check ownership
+    (asserts! (is-eq tx-sender sender) (err err-not-token-owner))
+
+    ;; Handle NFT transfer
+    (unwrap-panic (nft-transfer? programmable-vesting-nft token-id sender recipient))
+
+    ;; Update token ownership in our records
+    (match (map-get? tokens { token-id: token-id })
+      token-data (begin 
+                   (map-set tokens 
+                     { token-id: token-id }
+                     (merge token-data { owner: recipient })
+                   )
+                   (ok true))
+      (err err-invalid-token)
+    )
+  )
+)
+
+;; FEATURE 1: Token Metadata & Customization
+
+;; Allow token owners to set custom metadata
+(define-public (set-token-metadata (token-id uint) (name (string-ascii 64)) (description (string-ascii 256)) (image-uri (string-ascii 256)))
+  (let
+    ((token-data (unwrap! (map-get? tokens { token-id: token-id }) (err err-invalid-token)))
+     (owner (get owner token-data)))
+
+    ;; Verify ownership
+    (asserts! (is-eq tx-sender owner) (err err-not-token-owner))
+
+    ;; Store metadata
+    (ok (map-set token-metadata 
+      { token-id: token-id }
+      { 
+        name: name,
+        description: description,
+        image-uri: image-uri
+      }
+    ))
+  )
+)
+
+;; Get token metadata
+(define-read-only (get-token-metadata (token-id uint))
+  (match (map-get? token-metadata { token-id: token-id })
+    data (ok data)
+    (err err-invalid-token)
+  )
+)
+
+;; Staking & Rewards System
+
+;; Set reward rate
+(define-public (set-reward-rate (new-rate uint))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) (err err-owner-only))
+    (asserts! (> new-rate u0) (err err-invalid-params))
+    (ok (var-set reward-rate new-rate))
+  )
+)
+
+;; Stake token
+(define-public (stake-token (token-id uint))
+  (let
+    ((token-data (unwrap! (map-get? tokens { token-id: token-id }) (err err-invalid-token)))
+     (owner (get owner token-data)))
+
+    ;; Verify ownership
+    (asserts! (is-eq tx-sender owner) (err err-not-token-owner))
+
+    ;; Verify not already staked
+    (asserts! (is-none (map-get? staking-info { token-id: token-id })) (err err-already-staked))
+
+    ;; Record staking information
+    (ok (map-set staking-info 
+      { token-id: token-id }
+      { 
+        staked-at: stacks-block-height,
+        last-reward-claim: stacks-block-height
+      }
+    ))
+  )
+)
+
+;; Calculate pending rewards
+(define-read-only (get-pending-rewards (token-id uint))
+  (let
+    ((token-data (unwrap! (map-get? tokens { token-id: token-id }) (err err-invalid-token)))
+     (stake-data (unwrap! (map-get? staking-info { token-id: token-id }) (err err-not-staked))))
+
+    ;; Calculate rewards based on blocks passed
+    (let
+      ((blocks-staked (- stacks-block-height (get last-reward-claim stake-data)))
+       (level-multiplier (+ u1 (get current-level token-data)))
+       (reward-amount (* (* blocks-staked (var-get reward-rate)) level-multiplier)))
+
+      (ok reward-amount)
+    )
+  )
+)
+
+;; Claim staking rewards
+(define-public (claim-rewards (token-id uint))
+  (let
+    ((token-data (unwrap! (map-get? tokens { token-id: token-id }) (err err-invalid-token)))
+     (owner (get owner token-data))
+     (stake-data (unwrap! (map-get? staking-info { token-id: token-id }) (err err-not-staked))))
+
+    ;; Verify ownership
+    (asserts! (is-eq tx-sender owner) (err err-not-token-owner))
+
+    ;; Calculate rewards based on blocks passed
+    (let
+      ((blocks-staked (- stacks-block-height (get last-reward-claim stake-data)))
+       (level-multiplier (+ u1 (get current-level token-data)))
+       (reward-amount (* (* blocks-staked (var-get reward-rate)) level-multiplier)))
+
+      ;; Update last claim time
+      (map-set staking-info 
+        { token-id: token-id }
+        (merge stake-data { last-reward-claim: stacks-block-height })
+      )
+
+      ;; Transfer rewards
+      (match (as-contract (stx-transfer? reward-amount tx-sender owner))
+        success (ok reward-amount)
+        error (err err-staking-error))
+    )
+  )
+)
